@@ -1,0 +1,25 @@
+FROM maven:3.8-openjdk-11 AS build
+
+WORKDIR /app
+
+# Copy pom.xml and source code
+COPY pom.xml .
+COPY src ./src
+
+# Build the application
+RUN mvn clean package -DskipTests
+
+FROM flink:latest
+
+# Copy the JAR file
+COPY --from=build /app/target/taxi-trip-stream-1.0-SNAPSHOT.jar /opt/flink/usrlib/taxi-trip-stream.jar
+
+# Copy PostgreSQL JDBC driver
+ADD https://jdbc.postgresql.org/download/postgresql-42.5.1.jar /opt/flink/lib/
+
+# Copy custom entrypoint script
+COPY docker-entrypoint.sh /
+
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
