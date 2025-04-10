@@ -9,6 +9,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     restart: unless-stopped
+    networks:
+      - app-net
 
   kafka:
     image: wurstmeister/kafka:latest
@@ -26,6 +28,8 @@ services:
     depends_on:
       - zookeeper
     restart: unless-stopped
+    networks:
+      - app-net
 
   postgres:
     image: postgres:13
@@ -40,9 +44,11 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./init-scripts:/docker-entrypoint-initdb.d
     restart: unless-stopped
+    networks:
+      - app-net
 
   jobmanager:
-    image: flink:latest
+    image: flink:1.16.1-scala_2.12
     container_name: jobmanager
     ports:
       - "8081:8081"
@@ -50,19 +56,26 @@ services:
     environment:
       - JOB_MANAGER_RPC_ADDRESS=jobmanager
     restart: unless-stopped
+    networks:
+      - app-net
+    volumes:
+      - /workspaces/Datastream/target/taxi-trip-stream-1.0-SNAPSHOT.jar:/opt/flink/usrlib/taxi-trip-stream-1.0-SNAPSHOT.jar 
+
 
   taskmanager:
-    image: flink:latest
+    image: flink:1.16.1-scala_2.12
     container_name: taskmanager
     depends_on:
       - jobmanager
     command: taskmanager
     environment:
       - JOB_MANAGER_RPC_ADDRESS=jobmanager
-      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=2
+      - FLINK_TASKMANAGER_MEMORY=8192m   # Allocate 4GB for the TaskManager
+      - FLINK_TASKMANAGER_NUM_TASK_SLOTS=4  # Set two task slots per TaskManager
     restart: unless-stopped
+    networks:
+      - app-net
 
-  # Service to run our Flink application
   taxi-stream-app:
     build:
       context: ./
@@ -74,6 +87,12 @@ services:
       - kafka
       - postgres
     restart: on-failure
+    networks:
+      - app-net
 
 volumes:
   postgres-data:
+
+networks:
+  app-net:
+    driver: bridge

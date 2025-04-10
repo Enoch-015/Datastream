@@ -1,354 +1,241 @@
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
-import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
-import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
-import org.apache.flink.connector.jdbc.JdbcSink;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
-import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
-import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
-import org.apache.flink.util.Collector;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;  // Updated import
+import org.apache.flink.connector.jdbc.JdbcSink;
+import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.time.Duration;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.Properties;
 
 public class TaxiTripStreamJob {
 
+    // Azure PostgreSQL connection details
+    private static final String DB_URL = "jdbc:postgresql://floo3.postgres.database.azure.com:5432/postgres";
+    private static final String DB_USERNAME = "floo";
+    private static final String DB_PASSWORD = "Agents1234";
+    private static final String DB_DRIVER = "org.postgresql.Driver";
+
     public static void main(String[] args) throws Exception {
-        // Set up the streaming execution environment.
+        // Create necessary database tables if not exist
+        createSchemaIfNotExists();
+
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(60000); // Checkpoint every 60s
 
-        // Configure Kafka consumer properties for Docker environment
-        Properties properties = new Properties();
-        properties.setProperty("bootstrap.servers", "kafka:9092"); // Changed to Docker container name
-        properties.setProperty("group.id", "flink-taxi-group");
+        // -------------------------------
+        // 1. Kafka Source Setup
+        // -------------------------------
+        Properties kafkaProps = new Properties();
+        kafkaProps.setProperty("reconnect.backoff.ms", "1000");
 
-        // Create a Kafka consumer that reads raw CSV strings.
-        FlinkKafkaConsumer<String> consumer = new FlinkKafkaConsumer<>("taxi_topic", new SimpleStringSchema(), properties);
-        // Here you can assign watermarks if event-time processing is required.
-        consumer.assignTimestampsAndWatermarks(WatermarkStrategy.noWatermarks());
+        KafkaSource<String> kafkaSource = KafkaSource.<String>builder()
+            .setBootstrapServers("kafka:9092")
+            .setTopics("taxi_topic")
+            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setValueOnlyDeserializer(new SimpleStringSchema())
+            .setProperties(kafkaProps)
+            .build();
 
-        // Create a DataStream from Kafka.
-        DataStream<String> stream = env.addSource(consumer);
-
-        // Parse the CSV into a TaxiTrip POJO and filter out any parsing errors.
-        DataStream<TaxiTrip> trips = stream
-            .map(TaxiTrip::fromCsv)
-            .filter(trip -> trip != null);
-
-        // Enrich the data: calculate trip duration.
-        DataStream<TaxiTrip> enrichedTrips = trips.map(trip -> {
-            trip.calculateDuration();
-            return trip;
-        });
-
-        // Filter out any trips with outlier values.
-        DataStream<TaxiTrip> filteredTrips = enrichedTrips.filter(trip ->
-            trip.getTripDistance() < 1000 && trip.getTotalAmount() < 500);
-
-        // Assign timestamps and watermarks based on pickup time.
-        DataStream<TaxiTrip> timestampedTrips = filteredTrips.assignTimestampsAndWatermarks(
-            WatermarkStrategy.<TaxiTrip>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-                .withTimestampAssigner((trip, ts) -> trip.getPickupTimeMillis())
+        DataStream<String> rawStream = env.fromSource(
+            kafkaSource,
+            WatermarkStrategy.<String>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+                .withIdleness(Duration.ofMinutes(1)),
+            "Kafka Source"
         );
 
-        // Save raw trip data to PostgreSQL
+        // -------------------------------
+        // 2. Parse CSV records to TaxiTrip objects
+        // -------------------------------
+        DataStream<TaxiTrip> timestampedTrips = rawStream
+            .map(rawMsg -> {
+                System.out.println("Parsing CSV: " + rawMsg);
+                TaxiTrip trip = TaxiTrip.fromCsv(rawMsg);
+                return trip;
+            })
+            .filter(trip -> trip != null)
+            .name("Parse-CSV");
+
+        // -------------------------------
+        // 3. Sink raw TaxiTrip data into taxi_trips table
+        // -------------------------------
         timestampedTrips.addSink(
             JdbcSink.sink(
                 "INSERT INTO taxi_trips (vendor_id, pickup_datetime, dropoff_datetime, passenger_count, trip_distance, " +
                 "rate_code_id, store_and_fwd_flag, pu_location_id, do_location_id, payment_type, fare_amount, extra, " +
                 "mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount, congestion_surcharge, " +
                 "airport_fee, trip_duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (statement, trip) -> {
-                    statement.setInt(1, trip.getVendorID());
-                    statement.setTimestamp(2, java.sql.Timestamp.valueOf(trip.getPickupDatetime()));
-                    statement.setTimestamp(3, java.sql.Timestamp.valueOf(trip.getDropoffDatetime()));
-                    statement.setInt(4, trip.getPassengerCount());
-                    statement.setDouble(5, trip.getTripDistance());
-                    statement.setInt(6, trip.getRatecodeID());
-                    statement.setString(7, trip.getStoreAndFwdFlag());
-                    statement.setInt(8, trip.getPuLocationID());
-                    statement.setInt(9, trip.getDoLocationID());
-                    statement.setInt(10, trip.getPaymentType());
-                    statement.setDouble(11, trip.getFareAmount());
-                    statement.setDouble(12, trip.getExtra());
-                    statement.setDouble(13, trip.getMtaTax());
-                    statement.setDouble(14, trip.getTipAmount());
-                    statement.setDouble(15, trip.getTollsAmount());
-                    statement.setDouble(16, trip.getImprovementSurcharge());
-                    statement.setDouble(17, trip.getTotalAmount());
-                    statement.setDouble(18, trip.getCongestionSurcharge());
-                    statement.setDouble(19, trip.getAirportFee());
-                    statement.setLong(20, trip.getTripDuration());
-                },
-                JdbcExecutionOptions.builder()
-                    .withBatchSize(1000)
-                    .withBatchIntervalMs(200)
-                    .withMaxRetries(5)
-                    .build(),
-                new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-                    .withUrl("jdbc:postgresql://postgres:5432/taxi_db") // Using container hostname
-                    .withDriverName("org.postgresql.Driver")
-                    .withUsername("postgres")
-                    .withPassword("postgres")
-                    .build()
-            )
-        );
-
-        // Compute hourly aggregates (e.g., average fare) using a tumbling window.
-        DataStream<HourlyAggregate> hourlyAggregates = timestampedTrips
-            .keyBy(TaxiTrip::getPickupHour)
-            .window(TumblingEventTimeWindows.of(Time.hours(1)))
-            .apply(new TaxiTripHourlyAggregateWindowFunction());
-
-        // Save hourly aggregates to PostgreSQL
-        hourlyAggregates.addSink(
-            JdbcSink.sink(
-                "INSERT INTO hourly_aggregates (hour, window_start, window_end, average_fare, trip_count) VALUES (?, ?, ?, ?, ?)",
-                (statement, aggregate) -> {
-                    statement.setInt(1, aggregate.getHour());
-                    statement.setTimestamp(2, new java.sql.Timestamp(aggregate.getWindowStart()));
-                    statement.setTimestamp(3, new java.sql.Timestamp(aggregate.getWindowEnd()));
-                    statement.setDouble(4, aggregate.getAverageFare());
-                    statement.setInt(5, aggregate.getTripCount());
+                (stmt, trip) -> {
+                    stmt.setInt(1, trip.getVendorID());
+                    stmt.setTimestamp(2, java.sql.Timestamp.valueOf(trip.getPickupDatetime()));
+                    stmt.setTimestamp(3, java.sql.Timestamp.valueOf(trip.getDropoffDatetime()));
+                    stmt.setInt(4, trip.getPassengerCount());
+                    stmt.setDouble(5, trip.getTripDistance());
+                    stmt.setInt(6, trip.getRatecodeID());
+                    stmt.setString(7, trip.getStoreAndFwdFlag());
+                    stmt.setInt(8, trip.getPuLocationID());
+                    stmt.setInt(9, trip.getDoLocationID());
+                    stmt.setInt(10, trip.getPaymentType());
+                    stmt.setDouble(11, trip.getFareAmount());
+                    stmt.setDouble(12, trip.getExtra());
+                    stmt.setDouble(13, trip.getMtaTax());
+                    stmt.setDouble(14, trip.getTipAmount());
+                    stmt.setDouble(15, trip.getTollsAmount());
+                    stmt.setDouble(16, trip.getImprovementSurcharge());
+                    stmt.setDouble(17, trip.getTotalAmount());
+                    stmt.setDouble(18, trip.getCongestionSurcharge());
+                    stmt.setDouble(19, trip.getAirportFee());
+                    stmt.setLong(20, trip.getTripDuration());
                 },
                 JdbcExecutionOptions.builder()
                     .withBatchSize(100)
-                    .withBatchIntervalMs(200)
+                    .withBatchIntervalMs(1000)
                     .withMaxRetries(5)
                     .build(),
                 new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-                    .withUrl("jdbc:postgresql://postgres:5432/taxi_db") // Using container hostname
-                    .withDriverName("org.postgresql.Driver")
-                    .withUsername("postgres")
-                    .withPassword("postgres")
+                    .withUrl(DB_URL)
+                    .withDriverName(DB_DRIVER)
+                    .withUsername(DB_USERNAME)
+                    .withPassword(DB_PASSWORD)
                     .build()
             )
-        );
+        ).name("JDBC-Taxi-Trips-Sink");
 
-        // For demonstration, print the aggregates.
-        hourlyAggregates.print();
+        // -------------------------------
+        // 4. Transform TaxiTrip into YellowTaxiStreamRecord and sink into yellow_taxi_stream table
+        // -------------------------------
+        DataStream<YellowTaxiStreamRecord> yellowStream = timestampedTrips
+            .map(YellowTaxiStreamRecord::fromTrip)
+            .name("Transform-To-YellowTaxiStream");
 
-        // Execute the job.
+        yellowStream.addSink(
+            JdbcSink.sink(
+                "INSERT INTO yellow_taxi_stream (vendor_name, pickup_datetime, dropoff_datetime, passenger_count, " +
+                "trip_distance, rate_code_name, store_and_fwd_flag, pu_location_id, do_location_id, payment_type_name, " +
+                "fare_amount, extra, mta_tax, tip_amount, tolls_amount, improvement_surcharge, total_amount, " +
+                "congestion_surcharge, airport_fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stmt, record) -> {
+                    stmt.setString(1, record.vendorName);
+                    stmt.setTimestamp(2, java.sql.Timestamp.valueOf(record.pickupDatetime));
+                    stmt.setTimestamp(3, java.sql.Timestamp.valueOf(record.dropoffDatetime));
+                    stmt.setInt(4, record.passengerCount);
+                    stmt.setDouble(5, record.tripDistance);
+                    stmt.setString(6, record.rateCodeName);
+                    stmt.setString(7, record.storeAndFwdFlag);
+                    stmt.setInt(8, record.puLocationID);
+                    stmt.setInt(9, record.doLocationID);
+                    stmt.setString(10, record.paymentTypeName);
+                    stmt.setDouble(11, record.fareAmount);
+                    stmt.setDouble(12, record.extra);
+                    stmt.setDouble(13, record.mtaTax);
+                    stmt.setDouble(14, record.tipAmount);
+                    stmt.setDouble(15, record.tollsAmount);
+                    stmt.setDouble(16, record.improvementSurcharge);
+                    stmt.setDouble(17, record.totalAmount);
+                    stmt.setDouble(18, record.congestionSurcharge);
+                    stmt.setDouble(19, record.airportFee);
+                },
+                JdbcExecutionOptions.builder()
+                    .withBatchSize(20)
+                    .withBatchIntervalMs(2000)
+                    .withMaxRetries(3)
+                    .build(),
+                new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                    .withUrl(DB_URL)
+                    .withDriverName(DB_DRIVER)
+                    .withUsername(DB_USERNAME)
+                    .withPassword(DB_PASSWORD)
+                    .build()
+            )
+        ).name("JDBC-Yellow-Taxi-Stream-Sink");
+
+        // -------------------------------
+        // 5. Hourly Aggregation using Tumbling Windows and sink into hourly_aggregates table
+        // -------------------------------
+        DataStream<HourlyAggregate> hourlyAggregates = timestampedTrips
+            .keyBy(TaxiTrip::getPickupHour)
+            .window(org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows.of(Time.hours(1)))
+            .allowedLateness(Time.minutes(5))
+            .apply(new TaxiTripHourlyAggregateWindowFunction());
+
+        hourlyAggregates.addSink(
+            JdbcSink.sink(
+                "INSERT INTO hourly_aggregates (hour, window_start, window_end, average_fare, trip_count) VALUES (?, ?, ?, ?, ?)",
+                (stmt, agg) -> {
+                    stmt.setInt(1, agg.getHour());
+                    stmt.setTimestamp(2, new java.sql.Timestamp(agg.getWindowStart()));
+                    stmt.setTimestamp(3, new java.sql.Timestamp(agg.getWindowEnd()));
+                    stmt.setDouble(4, agg.getAverageFare());
+                    stmt.setInt(5, agg.getTripCount());
+                },
+                JdbcExecutionOptions.builder()
+                    .withBatchSize(10)
+                    .withBatchIntervalMs(1000)
+                    .withMaxRetries(5)
+                    .build(),
+                new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                    .withUrl(DB_URL)
+                    .withDriverName(DB_DRIVER)
+                    .withUsername(DB_USERNAME)
+                    .withPassword(DB_PASSWORD)
+                    .build()
+            )
+        ).name("JDBC-Hourly-Aggregates-Sink");
+
+        // Optionally, print streams for debugging
+        rawStream.print("Raw-Message");
+        timestampedTrips.print("Final-Trip");
+        hourlyAggregates.print("Hourly-Aggregate");
+
         env.execute("Taxi Trip Streaming Job");
     }
-}
 
-// POJO for TaxiTrip.
-class TaxiTrip {
-    private int vendorID;
-    private LocalDateTime pickupDatetime;
-    private LocalDateTime dropoffDatetime;
-    private int passengerCount;
-    private double tripDistance;
-    private int ratecodeID;
-    private String storeAndFwdFlag;
-    private int puLocationID;
-    private int doLocationID;
-    private int paymentType;
-    private double fareAmount;
-    private double extra;
-    private double mtaTax;
-    private double tipAmount;
-    private double tollsAmount;
-    private double improvementSurcharge;
-    private double totalAmount;
-    private double congestionSurcharge;
-    private double airportFee;
+    private static void createSchemaIfNotExists() {
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USERNAME, DB_PASSWORD);
+             Statement stmt = conn.createStatement()) {
 
-    // Calculated field
-    private long tripDuration; // in seconds
+            // Create taxi_trips table (raw data)
+            String createTaxiTripsTable = "CREATE TABLE IF NOT EXISTS taxi_trips (" +
+                "id SERIAL PRIMARY KEY, vendor_id INTEGER, pickup_datetime TIMESTAMP, " +
+                "dropoff_datetime TIMESTAMP, passenger_count INTEGER, trip_distance DOUBLE PRECISION, " +
+                "rate_code_id INTEGER, store_and_fwd_flag VARCHAR(1), pu_location_id INTEGER, " +
+                "do_location_id INTEGER, payment_type INTEGER, fare_amount DOUBLE PRECISION, " +
+                "extra DOUBLE PRECISION, mta_tax DOUBLE PRECISION, tip_amount DOUBLE PRECISION, " +
+                "tolls_amount DOUBLE PRECISION, improvement_surcharge DOUBLE PRECISION, " +
+                "total_amount DOUBLE PRECISION, congestion_surcharge DOUBLE PRECISION, " +
+                "airport_fee DOUBLE PRECISION, trip_duration BIGINT" +
+                ")";
+            stmt.executeUpdate(createTaxiTripsTable);
 
-    // Example CSV format: "VendorID,tpep_pickup_datetime,tpep_dropoff_datetime,passenger_count,trip_distance,..."
-    public static TaxiTrip fromCsv(String csvLine) {
-        try {
-            String[] parts = csvLine.split(",");
-            TaxiTrip trip = new TaxiTrip();
-            trip.vendorID = Integer.parseInt(parts[0]);
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-            trip.pickupDatetime = LocalDateTime.parse(parts[1], formatter);
-            trip.dropoffDatetime = LocalDateTime.parse(parts[2], formatter);
-            trip.passengerCount = Integer.parseInt(parts[3]);
-            trip.tripDistance = Double.parseDouble(parts[4]);
-            trip.ratecodeID = Integer.parseInt(parts[5]);
-            trip.storeAndFwdFlag = parts[6];
-            trip.puLocationID = Integer.parseInt(parts[7]);
-            trip.doLocationID = Integer.parseInt(parts[8]);
-            trip.paymentType = Integer.parseInt(parts[9]);
-            trip.fareAmount = Double.parseDouble(parts[10]);
-            trip.extra = Double.parseDouble(parts[11]);
-            trip.mtaTax = Double.parseDouble(parts[12]);
-            trip.tipAmount = Double.parseDouble(parts[13]);
-            trip.tollsAmount = Double.parseDouble(parts[14]);
-            trip.improvementSurcharge = Double.parseDouble(parts[15]);
-            trip.totalAmount = Double.parseDouble(parts[16]);
-            trip.congestionSurcharge = Double.parseDouble(parts[17]);
-            trip.airportFee = Double.parseDouble(parts[18]);
-            return trip;
+            // Create hourly_aggregates table
+            String createHourlyAggregatesTable = "CREATE TABLE IF NOT EXISTS hourly_aggregates (" +
+                "id SERIAL PRIMARY KEY, hour INTEGER, window_start TIMESTAMP, window_end TIMESTAMP, " +
+                "average_fare DOUBLE PRECISION, trip_count INTEGER" +
+                ")";
+            stmt.executeUpdate(createHourlyAggregatesTable);
+
+            // Create yellow_taxi_stream table
+            String createYellowTaxiStreamTable = "CREATE TABLE IF NOT EXISTS yellow_taxi_stream (" +
+                "id SERIAL PRIMARY KEY, vendor_name VARCHAR(50), pickup_datetime TIMESTAMP, " +
+                "dropoff_datetime TIMESTAMP, passenger_count INTEGER, trip_distance DOUBLE PRECISION, " +
+                "rate_code_name VARCHAR(50), store_and_fwd_flag VARCHAR(1), pu_location_id INTEGER, " +
+                "do_location_id INTEGER, payment_type_name VARCHAR(50), fare_amount DOUBLE PRECISION, " +
+                "extra DOUBLE PRECISION, mta_tax DOUBLE PRECISION, tip_amount DOUBLE PRECISION, " +
+                "tolls_amount DOUBLE PRECISION, improvement_surcharge DOUBLE PRECISION, " +
+                "total_amount DOUBLE PRECISION, congestion_surcharge DOUBLE PRECISION, " +
+                "airport_fee DOUBLE PRECISION" +
+                ")";
+            stmt.executeUpdate(createYellowTaxiStreamTable);
+
         } catch (Exception e) {
-            // Log parsing error in production code.
-            return null;
+            e.printStackTrace();
         }
-    }
-
-    // Calculate trip duration in seconds.
-    public void calculateDuration() {
-        this.tripDuration = java.time.Duration.between(pickupDatetime, dropoffDatetime).getSeconds();
-    }
-
-    // Return pickup time as milliseconds for event time processing.
-    public long getPickupTimeMillis() {
-        return pickupDatetime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
-    }
-
-    // Get hour of the pickup for keying.
-    public int getPickupHour() {
-        return pickupDatetime.getHour();
-    }
-
-    // Getters for all fields (needed for JdbcSink)
-    public int getVendorID() {
-        return vendorID;
-    }
-
-    public LocalDateTime getPickupDatetime() {
-        return pickupDatetime;
-    }
-
-    public LocalDateTime getDropoffDatetime() {
-        return dropoffDatetime;
-    }
-
-    public int getPassengerCount() {
-        return passengerCount;
-    }
-
-    public double getTripDistance() {
-        return tripDistance;
-    }
-
-    public int getRatecodeID() {
-        return ratecodeID;
-    }
-
-    public String getStoreAndFwdFlag() {
-        return storeAndFwdFlag;
-    }
-
-    public int getPuLocationID() {
-        return puLocationID;
-    }
-
-    public int getDoLocationID() {
-        return doLocationID;
-    }
-
-    public int getPaymentType() {
-        return paymentType;
-    }
-
-    public double getFareAmount() {
-        return fareAmount;
-    }
-
-    public double getExtra() {
-        return extra;
-    }
-
-    public double getMtaTax() {
-        return mtaTax;
-    }
-
-    public double getTipAmount() {
-        return tipAmount;
-    }
-
-    public double getTollsAmount() {
-        return tollsAmount;
-    }
-
-    public double getImprovementSurcharge() {
-        return improvementSurcharge;
-    }
-
-    public double getTotalAmount() {
-        return totalAmount;
-    }
-
-    public double getCongestionSurcharge() {
-        return congestionSurcharge;
-    }
-
-    public double getAirportFee() {
-        return airportFee;
-    }
-
-    public long getTripDuration() {
-        return tripDuration;
-    }
-}
-
-// POJO for hourly aggregate results.
-class HourlyAggregate {
-    private int hour;
-    private long windowStart;
-    private long windowEnd;
-    private double averageFare;
-    private int tripCount;
-
-    public HourlyAggregate(int hour, long windowStart, long windowEnd, double averageFare, int tripCount) {
-        this.hour = hour;
-        this.windowStart = windowStart;
-        this.windowEnd = windowEnd;
-        this.averageFare = averageFare;
-        this.tripCount = tripCount;
-    }
-
-    // Getters for JdbcSink
-    public int getHour() {
-        return hour;
-    }
-
-    public long getWindowStart() {
-        return windowStart;
-    }
-
-    public long getWindowEnd() {
-        return windowEnd;
-    }
-
-    public double getAverageFare() {
-        return averageFare;
-    }
-
-    public int getTripCount() {
-        return tripCount;
-    }
-
-    @Override
-    public String toString() {
-        return "Hour: " + hour + ", Window: [" + windowStart + ", " + windowEnd + "], Average Fare: " 
-               + averageFare + ", Trips: " + tripCount;
-    }
-}
-
-// WindowFunction to compute hourly aggregates.
-class TaxiTripHourlyAggregateWindowFunction implements WindowFunction<TaxiTrip, HourlyAggregate, Integer, TimeWindow> {
-    @Override
-    public void apply(Integer hour, TimeWindow window, Iterable<TaxiTrip> input, Collector<HourlyAggregate> out) {
-        int count = 0;
-        double fareSum = 0.0;
-        for (TaxiTrip trip : input) {
-            fareSum += trip.getFareAmount();
-            count++;
-        }
-        double averageFare = count > 0 ? fareSum / count : 0;
-        out.collect(new HourlyAggregate(hour, window.getStart(), window.getEnd(), averageFare, count));
     }
 }

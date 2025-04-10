@@ -1,0 +1,5 @@
+TaxiTripHourlyAggregateWindowFunction.class
+TaxiTripStreamJob.class
+HourlyAggregate.class
+YellowTaxiStreamRecord.class
+TaxiTrip.class

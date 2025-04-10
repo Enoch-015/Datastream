@@ -1,25 +1,14 @@
-FROM maven:3.8-openjdk-11 AS build
+# Use an official Python runtime as a parent image
+FROM python:3.12-slim
 
+# Set the working directory in the container
 WORKDIR /app
 
-# Copy pom.xml and source code
-COPY pom.xml .
-COPY src ./src
+# Copy the current directory contents into the container at /app
+COPY . /app
 
-# Build the application
-RUN mvn clean package -DskipTests
+# Install the required Python packages (ensure you have a requirements.txt file in the same directory)
+RUN pip install --no-cache-dir -r requirements.txt
 
-FROM flink:latest
-
-# Copy the JAR file
-COPY --from=build /app/target/taxi-trip-stream-1.0-SNAPSHOT.jar /opt/flink/usrlib/taxi-trip-stream.jar
-
-# Copy PostgreSQL JDBC driver
-ADD https://jdbc.postgresql.org/download/postgresql-42.5.1.jar /opt/flink/lib/
-
-# Copy custom entrypoint script
-COPY docker-entrypoint.sh /
-
-RUN chmod +x /docker-entrypoint.sh
-
-ENTRYPOINT ["/docker-entrypoint.sh"]
+# Run the script when the container launches
+CMD ["python", "stream.py"]

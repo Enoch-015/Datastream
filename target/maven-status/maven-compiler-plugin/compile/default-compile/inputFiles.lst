@@ -1,0 +1,5 @@
+/workspaces/Datastream/src/main/java/YellowTaxiStreamRecord.java
+/workspaces/Datastream/src/main/java/TaxiTripStreamJob.java
+/workspaces/Datastream/src/main/java/TaxiTripHourlyAggregateWindowFunction.java
+/workspaces/Datastream/src/main/java/HourlyAggregate.java
+/workspaces/Datastream/src/main/java/TaxiTrip.java

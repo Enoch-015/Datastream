@@ -1,0 +1,8 @@
+cat data_stream.csv | while read line; do
+  echo $line | docker exec -i kafka kafka-console-producer.sh --bootstrap-server kafka:9092 --topic taxi_topic
+done
+
+
+docker cp target/taxi-stream-app-1.0-SNAPSHOT.jar jobmanager:/opt/flink/usrlib/
+
+docker exec jobmanager rm -rf /opt/flink/usrlib/
