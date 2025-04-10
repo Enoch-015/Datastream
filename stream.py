@@ -1,90 +1,99 @@
-import asyncio
-import json
-import time
 import psycopg2
-from aiokafka import AIOKafkaProducer
-from psycopg2.extras import RealDictCursor
+import subprocess
+import time
+import csv
+import io
+import os
+from tqdm import tqdm
+import time 
 
-# PostgreSQL connection info
-PG_HOST = "floo3.postgres.database.azure.com"
-PG_DB = "postgres"
-PG_USER = "floo"
-PG_PASS = "Agents1234"
-PG_TABLE = "yellow_taxi_data"
+# Azure PostgreSQL database connection parameters
+db_params = {
+    'host': 'floo3.postgres.database.azure.com',
+    'database': 'postgres',
+    'user': 'floo',
+    'password': 'Agents1234',
+    'port': '5432',
+    'sslmode': 'require'  # Required for Azure PostgreSQL
+}
 
-# Kafka info
-KAFKA_BROKER = "kafka:9092"  # Or your Docker container
-KAFKA_TOPIC = "taxi_topic"
+# Kafka parameters
+kafka_topic = 'taxi_topic'
+kafka_bootstrap_server = 'kafka:9092'
 
-# Batch size and streaming interval (30 rows every minute)
+# Batch size and total records to stream
 BATCH_SIZE = 30
-STREAM_INTERVAL = 60  # 60 seconds (1 minute)
+TOTAL_RECORDS = 2700000
 
-# Connect to PostgreSQL asynchronously (we'll use asyncpg for better async support)
-import asyncpg
-
-async def get_postgres_connection():
-    return await asyncpg.connect(
-        user=PG_USER,
-        password=PG_PASS,
-        database=PG_DB,
-        host=PG_HOST
-    )
-
-# Connect to Kafka
-async def get_kafka_producer():
-    producer = AIOKafkaProducer(
-        loop=asyncio.get_event_loop(),
-        bootstrap_servers=KAFKA_BROKER
-    )
-    await producer.start()
-    return producer
-
-async def stream_data_to_kafka():
-    # Get PostgreSQL connection
-    conn = await get_postgres_connection()
-    
-    # Get Kafka producer
-    producer = await get_kafka_producer()
-    
-    # Get total number of rows (optional: if you want to track progress)
-    total_rows = await conn.fetchval(f"SELECT COUNT(*) FROM {PG_TABLE}")
-    print(f"Total rows to process: {total_rows}")
-
-    offset = 0
-    while offset < total_rows:
-        print(f"Processing batch from offset {offset}...")
-
-        # Fetch the batch from PostgreSQL asynchronously
-        rows = await conn.fetch(f"SELECT * FROM {PG_TABLE} LIMIT {BATCH_SIZE} OFFSET {offset}")
+def stream_data_to_kafka():
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(**db_params)
+        cursor = conn.cursor()
         
-        # Process the fetched rows
-        tasks = []
-        for row in rows:
-            # Convert row to dictionary for JSON serialization
-            data = dict(row)
-            tasks.append(producer.send(KAFKA_TOPIC, value=data))  # Send to Kafka asynchronously
-
-        # Wait for all Kafka sends to finish
-        await asyncio.gather(*tasks)
-
-        # Commit the batch and move the offset
-        offset += len(rows)
+        # Set up a query to fetch data with a cursor for memory efficiency
+        # Replace 'your_table' with your actual table name
+        print
+        cursor.execute("SELECT * FROM yellow_taxi_data")
         
-        # Optional: log progress and rate limit
-        print(f"Batch {offset // BATCH_SIZE} sent to Kafka, sleeping for {STREAM_INTERVAL} seconds...")
-        await asyncio.sleep(STREAM_INTERVAL)
+        # Initialize counters and progress bar
+        records_processed = 0
+        progress_bar = tqdm(total=TOTAL_RECORDS, desc="Streaming data")
+        
+        while records_processed < TOTAL_RECORDS:
+            # Fetch a batch of records
+            batch = cursor.fetchmany(BATCH_SIZE)
+            
+            # Break if no more records
+            if not batch:
+                print(f"Reached end of table after {records_processed} records.")
+                break
+            
+            # Convert batch to CSV format
+            output = io.StringIO()
+            csv_writer = csv.writer(output)
+            for row in batch:
+                csv_writer.writerow(row)
+            
+            # Send to Kafka using the kafka-console-producer
+            kafka_cmd = [
+                'docker', 'exec', '-i', 'kafka', 
+                'kafka-console-producer.sh', 
+                '--bootstrap-server', kafka_bootstrap_server, 
+                '--topic', kafka_topic
+            ]
+            
+            process = subprocess.Popen(
+                kafka_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            stdout, stderr = process.communicate(input=output.getvalue())
+            
+            if process.returncode != 0:
+                print(f"Error sending batch to Kafka: {stderr}")
+                continue
+            
+            # Update counters and progress bar
+            records_processed += len(batch)
+            progress_bar.update(len(batch))
+            
+            # Optional: Add a small delay to control the stream rate
+            time.sleep(0.1)
+        
+        progress_bar.close()
+        print(f"Completed streaming {records_processed} records to Kafka.")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
-    # Clean up connections
-    await conn.close()
-    await producer.stop()
-
-    print("Done streaming data to Kafka.")
-
-# Run the streaming job asynchronously
-async def main():
-    await stream_data_to_kafka()
-
-# Start the asynchronous job
 if __name__ == "__main__":
-    asyncio.run(main())
+    stream_data_to_kafka()

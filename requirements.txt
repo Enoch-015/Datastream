@@ -1,3 +1,5 @@
 psycopg2
 aiokafka
 asyncpg
+confluent-kafka
+tqdm
